@@ -14,100 +14,64 @@
 %% limitations under the License.
 %%--------------------------------------------------------------------
 
-%% @doc ACL with MySQL Database
--module(emq_acl_mysql).
+-module(emq_auth_mysql).
 
--behaviour(emqttd_acl_mod).
+-behaviour(emqttd_auth_mod).
+
+-include("emq_auth_mysql.hrl").
 
 -include_lib("emqttd/include/emqttd.hrl").
 
-%% ACL Callbacks
--export([init/1, check_acl/2, reload_acl/1, description/0]).
+-import(emq_auth_mysql_cli, [is_superuser/2, query/3]).
 
--record(state, {acl_query}).
+-export([init/1, check/3, description/0]).
 
-init(AclQuery) ->
-    {ok, #state{acl_query = AclQuery}}.
+-record(state, {auth_query, super_query, hash_type}).
 
-check_acl({#mqtt_client{username = <<$$, _/binary>>}, _PubSub, _Topic}, _State) ->
-    ignore; 
+-define(EMPTY(Username), (Username =:= undefined orelse Username =:= <<>>)).
 
-check_acl({Client, PubSub, Topic}, #state{acl_query   = {AclSql, AclParams}}) ->
-    case emq_auth_mysql_cli:query(AclSql, AclParams, Client) of
-        {ok, _Columns, []} ->
-            ignore;
-        {ok, _Columns, Rows} ->
-            Rules = filter(PubSub, compile(Rows)),
-            case match(Client, Topic, Rules) of
-                {matched, allow} -> allow;
-                {matched, deny}  -> deny;
-                nomatch          -> ignore
-            end;
-        {error, Reason} ->
-            lager:error("Mysql check_acl error: ~p~n", [Reason]),
-            ignore
-    end.
+-define(LOG(Level, Format, Args),
+    lager:Level("MQTT-SN(ASLEEP-TIMER): " ++ Format, Args)).
 
-match(_Client, _Topic, []) ->
-    nomatch;
+init({AuthQuery, SuperQuery, HashType}) ->
+    {ok, #state{auth_query = AuthQuery, super_query = SuperQuery, hash_type = HashType}}.
+check(#mqtt_client{username = Username}, Password, _State) when ?EMPTY(Username) ->
+    {error, username_or_password_undefined};
+check(Client, Password, #state{auth_query  = {AuthSql, AuthParams},
+                               super_query = SuperQuery,
+                               hash_type   = HashType}) ->
+    Passwd = if ?EMPTY(Password) -> 
+             <<"">>;
+	     true ->
+             Password 
+      end,
+    Result = case query(AuthSql, AuthParams, Client) of
+                 {ok, [<<"password">>], [[PassHash]]} ->
+                     check_pass(PassHash, Passwd, HashType);
+                 {ok, [<<"password">>, <<"salt">>], [[PassHash, Salt]]} ->
+                     check_pass(PassHash, Salt, Passwd, HashType);
+                 {ok, _Columns, []} ->
+                     ignore;
+                 {error, Reason} ->
+                     {error, Reason}
+             end,
+    ?LOG(error,"result=~p",[Result]),
+    case Result of ok -> {ok, is_superuser(SuperQuery, Client)}; Error -> Error end.
 
-match(Client, Topic, [Rule|Rules]) ->
-    case emqttd_access_rule:match(Client, Topic, Rule) of
-        nomatch -> match(Client, Topic, Rules);
-        {matched, AllowDeny} -> {matched, AllowDeny}
-    end.
+check_pass(PassHash, Passwd, HashType) ->
+    check_pass(PassHash, hash(HashType, Passwd)).
+check_pass(PassHash, Salt, Passwd, {pbkdf2, Macfun, Iterations, Dklen}) ->
+    check_pass(PassHash, hash(pbkdf2, {Salt, Passwd, Macfun, Iterations, Dklen}));
+check_pass(PassHash, Salt, Passwd, {salt, bcrypt}) ->
+    check_pass(PassHash, hash(bcrypt, {Salt, Passwd}));
+check_pass(PassHash, Salt, Passwd, {salt, HashType}) ->
+    check_pass(PassHash, hash(HashType, <<Salt/binary, Passwd/binary>>));
+check_pass(PassHash, Salt, Passwd, {HashType, salt}) ->
+    check_pass(PassHash, hash(HashType, <<Passwd/binary, Salt/binary>>)).
 
-filter(PubSub, Rules) ->
-    [Term || Term = {_, _, Access, _} <- Rules, Access =:= PubSub orelse Access =:= pubsub].
+check_pass(PassHash, PassHash) -> ok;
+check_pass(_, _)               -> {error, password_error}.
 
-compile(Rows) ->
-    compile(Rows, []).
-compile([], Acc) ->
-    Acc;
-compile([[Allow, IpAddr, Username, ClientId, Access, Topic]|T], Acc) ->
-    Who  = who(IpAddr, Username, ClientId),
-    Term = {allow(Allow), Who, access(Access), [topic(Topic)]},
-    compile(T, [emqttd_access_rule:compile(Term) | Acc]).
+description() -> "Authentication with MySQL".
 
-who(_, <<"$all">>, _) ->
-    all;
-who(null, null, null) ->
-    throw(undefined_who);
-who(CIDR, Username, ClientId) ->
-    Cols = [{ipaddr, b2l(CIDR)}, {user, Username}, {client, ClientId}],
-    case [{C, V} || {C, V} <- Cols, not empty(V)] of
-        [Who] -> Who;
-        Conds -> {'and', Conds}
-    end.
-
-allow(1)  -> allow;
-allow(0)  -> deny;
-allow(<<"1">>)  -> allow;
-allow(<<"0">>)  -> deny.
-
-access(1) -> subscribe;
-access(2) -> publish;
-access(3) -> pubsub;
-access(<<"1">>) -> subscribe;
-access(<<"2">>) -> publish;
-access(<<"3">>) -> pubsub.
-
-topic(<<"eq ", Topic/binary>>) ->
-    {eq, Topic};
-topic(Topic) ->
-    Topic.
-
-reload_acl(_State) ->
-    ok.
-
-description() ->
-    "ACL with Mysql".
-
-b2l(null) -> null;
-b2l(B)    -> binary_to_list(B).
-
-empty(null) -> true;
-empty("")   -> true;
-empty(<<>>) -> true;
-empty(_)    -> false.
-
+hash(Type, Passwd) -> emqttd_auth_mod:passwd_hash(Type, Passwd).
