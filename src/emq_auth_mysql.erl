@@ -33,17 +33,22 @@
 init({AuthQuery, SuperQuery, HashType}) ->
     {ok, #state{auth_query = AuthQuery, super_query = SuperQuery, hash_type = HashType}}.
 
-check(#mqtt_client{username = Username}, Password, _State) when ?EMPTY(Username); ?EMPTY(Password) ->
+check(#mqtt_client{username = Username}, Password, _State) when ?EMPTY(Username) ->
     {error, username_or_password_undefined};
 
 check(Client, Password, #state{auth_query  = {AuthSql, AuthParams},
                                super_query = SuperQuery,
                                hash_type   = HashType}) ->
-    Result = case query(AuthSql, AuthParams, Client) of
+    Passwd = if ?EMPTY(Password) -> 
+             <<"">>;
+	     true ->
+             Password 
+      end,   
+   Result = case query(AuthSql, AuthParams, Client) of
                  {ok, [<<"password">>], [[PassHash]]} ->
-                     check_pass(PassHash, Password, HashType);
+                     check_pass(PassHash, Passwd, HashType);
                  {ok, [<<"password">>, <<"salt">>], [[PassHash, Salt]]} ->
-                     check_pass(PassHash, Salt, Password, HashType);
+                     check_pass(PassHash, Salt, Passwd, HashType);
                  {ok, _Columns, []} ->
                      ignore;
                  {error, Reason} ->
@@ -51,20 +56,20 @@ check(Client, Password, #state{auth_query  = {AuthSql, AuthParams},
              end,
     case Result of ok -> {ok, is_superuser(SuperQuery, Client)}; Error -> Error end.
 
-check_pass(PassHash, Password, HashType) ->
-    check_pass(PassHash, hash(HashType, Password)).
-check_pass(PassHash, Salt, Password, {pbkdf2, Macfun, Iterations, Dklen}) ->
-    check_pass(PassHash, hash(pbkdf2, {Salt, Password, Macfun, Iterations, Dklen}));
-check_pass(PassHash, Salt, Password, {salt, bcrypt}) ->
-    check_pass(PassHash, hash(bcrypt, {Salt, Password}));
-check_pass(PassHash, Salt, Password, {salt, HashType}) ->
-    check_pass(PassHash, hash(HashType, <<Salt/binary, Password/binary>>));
-check_pass(PassHash, Salt, Password, {HashType, salt}) ->
-    check_pass(PassHash, hash(HashType, <<Password/binary, Salt/binary>>)).
+check_pass(PassHash, Passwd, HashType) ->
+    check_pass(PassHash, hash(HashType, Passwd)).
+check_pass(PassHash, Salt, Passwd, {pbkdf2, Macfun, Iterations, Dklen}) ->
+    check_pass(PassHash, hash(pbkdf2, {Salt, Passwd, Macfun, Iterations, Dklen}));
+check_pass(PassHash, Salt, Passwd, {salt, bcrypt}) ->
+    check_pass(PassHash, hash(bcrypt, {Salt, Passwd}));
+check_pass(PassHash, Salt, Passwd, {salt, HashType}) ->
+    check_pass(PassHash, hash(HashType, <<Salt/binary, Passwd/binary>>));
+check_pass(PassHash, Salt, Passwd, {HashType, salt}) ->
+    check_pass(PassHash, hash(HashType, <<Passwd/binary, Salt/binary>>)).
 
 check_pass(PassHash, PassHash) -> ok;
 check_pass(_, _)               -> {error, password_error}.
 
 description() -> "Authentication with MySQL".
 
-hash(Type, Password) -> emqttd_auth_mod:passwd_hash(Type, Password).
+hash(Type, Passwd) -> emqttd_auth_mod:passwd_hash(Type, Passwd).
